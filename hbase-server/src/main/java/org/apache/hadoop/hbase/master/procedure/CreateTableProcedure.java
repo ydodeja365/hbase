@@ -35,12 +35,15 @@ import org.apache.hadoop.hbase.fs.ErasureCodingUtils;
 import org.apache.hadoop.hbase.master.MasterCoprocessorHost;
 import org.apache.hadoop.hbase.master.MasterFileSystem;
 import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;
+import org.apache.hadoop.hbase.procedure2.ProcedureSuspendedException;
+import org.apache.hadoop.hbase.procedure2.ProcedureUtil;
 import org.apache.hadoop.hbase.regionserver.storefiletracker.StoreFileTrackerFactory;
 import org.apache.hadoop.hbase.regionserver.storefiletracker.StoreFileTrackerValidationUtils;
 import org.apache.hadoop.hbase.rsgroup.RSGroupInfo;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.FSTableDescriptors;
 import org.apache.hadoop.hbase.util.ModifyRegionUtils;
+import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,13 +54,17 @@ import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.CreateTableState;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ProcedureProtos;
 
 @InterfaceAudience.Private
 public class CreateTableProcedure extends AbstractStateMachineTableProcedure<CreateTableState> {
   private static final Logger LOG = LoggerFactory.getLogger(CreateTableProcedure.class);
 
+  private static final int MAX_REGION_REPLICATION = 0x10000;
+
   private TableDescriptor tableDescriptor;
   private List<RegionInfo> newRegions;
+  private RetryCounter retryCounter;
 
   public CreateTableProcedure() {
     // Required by the Procedure framework to create the procedure on replay
@@ -78,16 +85,16 @@ public class CreateTableProcedure extends AbstractStateMachineTableProcedure<Cre
 
   @Override
   protected Flow executeFromState(final MasterProcedureEnv env, final CreateTableState state)
-    throws InterruptedException {
+    throws InterruptedException, ProcedureSuspendedException {
     LOG.info("{} execute state={}", this, state);
     try {
       switch (state) {
         case CREATE_TABLE_PRE_OPERATION:
           // Verify if we can create the table
-          boolean exists = !prepareCreate(env);
+          boolean success = prepareCreate(env);
           releaseSyncLatch();
 
-          if (exists) {
+          if (!success) {
             assert isFailed() : "the delete should have an exception here";
             return Flow.NO_MORE_STATE;
           }
@@ -129,6 +136,7 @@ public class CreateTableProcedure extends AbstractStateMachineTableProcedure<Cre
           break;
         case CREATE_TABLE_POST_OPERATION:
           postCreate(env);
+          retryCounter = null;
           return Flow.NO_MORE_STATE;
         default:
           throw new UnsupportedOperationException("unhandled state=" + state);
@@ -137,10 +145,24 @@ public class CreateTableProcedure extends AbstractStateMachineTableProcedure<Cre
       if (isRollbackSupported(state)) {
         setFailure("master-create-table", e);
       } else {
-        LOG.warn("Retriable error trying to create table=" + getTableName() + " state=" + state, e);
+        if (retryCounter == null) {
+          retryCounter = ProcedureUtil.createRetryCounter(env.getMasterConfiguration());
+        }
+        long backoff = retryCounter.getBackoffTimeAndIncrementAttempts();
+        LOG.warn("Retriable error trying to create table={},state={},suspend {}secs.",
+          getTableName(), state, backoff / 1000, e);
+        throw suspend(Math.toIntExact(backoff), true);
       }
     }
+    retryCounter = null;
     return Flow.HAS_MORE_STATE;
+  }
+
+  @Override
+  protected synchronized boolean setTimeoutFailure(MasterProcedureEnv env) {
+    setState(ProcedureProtos.ProcedureState.RUNNABLE);
+    env.getProcedureScheduler().addFront(this);
+    return false;
   }
 
   @Override
@@ -262,6 +284,14 @@ public class CreateTableProcedure extends AbstractStateMachineTableProcedure<Cre
         "Table " + getTableName().toString() + " should have at least one column family."));
       return false;
     }
+
+    int regionReplicationCount = tableDescriptor.getRegionReplication();
+    if (regionReplicationCount > MAX_REGION_REPLICATION) {
+      setFailure("master-create-table", new IllegalArgumentException(
+        "Region Replication cannot exceed " + MAX_REGION_REPLICATION + "."));
+      return false;
+    }
+
     if (!tableName.isSystemTable()) {
       // do not check rs group for system tables as we may block the bootstrap.
       Supplier<String> forWhom = () -> "table " + tableName;

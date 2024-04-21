@@ -222,13 +222,8 @@ public class BucketCache implements BlockCache, HeapSize {
    */
   transient final IdReadWriteLock<Long> offsetLock;
 
-  final NavigableSet<BlockCacheKey> blocksByHFile = new ConcurrentSkipListSet<>((a, b) -> {
-    int nameComparison = a.getHfileName().compareTo(b.getHfileName());
-    if (nameComparison != 0) {
-      return nameComparison;
-    }
-    return Long.compare(a.getOffset(), b.getOffset());
-  });
+  NavigableSet<BlockCacheKey> blocksByHFile = new ConcurrentSkipListSet<>(
+    Comparator.comparing(BlockCacheKey::getHfileName).thenComparingLong(BlockCacheKey::getOffset));
 
   /** Statistics thread schedule pool (for heavy debugging, could remove) */
   private transient final ScheduledExecutorService scheduleThreadPool =
@@ -288,6 +283,8 @@ public class BucketCache implements BlockCache, HeapSize {
   public BucketCache(String ioEngineName, long capacity, int blockSize, int[] bucketSizes,
     int writerThreadNum, int writerQLen, String persistencePath, int ioErrorsTolerationDuration,
     Configuration conf) throws IOException {
+    Preconditions.checkArgument(blockSize > 0,
+      "BucketCache capacity is set to " + blockSize + ", can not be less than 0");
     boolean useStrongRef = conf.getBoolean(STRONG_REF_KEY, STRONG_REF_DEFAULT);
     if (useStrongRef) {
       this.offsetLock = new IdReadWriteLockStrongRef<>();
@@ -750,7 +747,8 @@ public class BucketCache implements BlockCache, HeapSize {
     } else {
       return bucketEntryToUse.withWriteLock(offsetLock, () -> {
         if (backingMap.remove(cacheKey, bucketEntryToUse)) {
-          LOG.debug("removed key {} from back map in the evict process", cacheKey);
+          LOG.debug("removed key {} from back map with offset lock {} in the evict process",
+            cacheKey, bucketEntryToUse.offset());
           blockEvicted(cacheKey, bucketEntryToUse, !existedInRamCache, evictedByEvictionProcess);
           return true;
         }
@@ -1471,8 +1469,11 @@ public class BucketCache implements BlockCache, HeapSize {
   }
 
   private void parsePB(BucketCacheProtos.BucketCacheEntry proto) throws IOException {
-    backingMap = BucketProtoUtils.fromPB(proto.getDeserializersMap(), proto.getBackingMap(),
-      this::createRecycler);
+    Pair<ConcurrentHashMap<BlockCacheKey, BucketEntry>, NavigableSet<BlockCacheKey>> pair =
+      BucketProtoUtils.fromPB(proto.getDeserializersMap(), proto.getBackingMap(),
+        this::createRecycler);
+    backingMap = pair.getFirst();
+    blocksByHFile = pair.getSecond();
     fullyCachedFiles.clear();
     fullyCachedFiles.putAll(BucketProtoUtils.fromPB(proto.getCachedFilesMap()));
     if (proto.hasChecksum()) {
@@ -1658,17 +1659,19 @@ public class BucketCache implements BlockCache, HeapSize {
   @Override
   public int evictBlocksByHfileName(String hfileName) {
     fileNotFullyCached(hfileName);
-    Set<BlockCacheKey> keySet = blocksByHFile.subSet(new BlockCacheKey(hfileName, Long.MIN_VALUE),
-      true, new BlockCacheKey(hfileName, Long.MAX_VALUE), true);
-
+    Set<BlockCacheKey> keySet = getAllCacheKeysForFile(hfileName);
     int numEvicted = 0;
     for (BlockCacheKey key : keySet) {
       if (evictBlock(key)) {
         ++numEvicted;
       }
     }
-
     return numEvicted;
+  }
+
+  private Set<BlockCacheKey> getAllCacheKeysForFile(String hfileName) {
+    return blocksByHFile.subSet(new BlockCacheKey(hfileName, Long.MIN_VALUE), true,
+      new BlockCacheKey(hfileName, Long.MAX_VALUE), true);
   }
 
   /**
@@ -2073,43 +2076,62 @@ public class BucketCache implements BlockCache, HeapSize {
     // so we need to count all blocks for this file in the backing map under
     // a read lock for the block offset
     final List<ReentrantReadWriteLock> locks = new ArrayList<>();
-    LOG.debug("Notifying caching completed for file {}, with total blocks {}", fileName,
-      dataBlockCount);
+    LOG.debug("Notifying caching completed for file {}, with total blocks {}, and data blocks {}",
+      fileName, totalBlockCount, dataBlockCount);
     try {
       final MutableInt count = new MutableInt();
       LOG.debug("iterating over {} entries in the backing map", backingMap.size());
       backingMap.entrySet().stream().forEach(entry -> {
-        if (entry.getKey().getHfileName().equals(fileName.getName())) {
-          LOG.debug("found block for file {} in the backing map. Acquiring read lock for offset {}",
-            fileName, entry.getKey().getOffset());
-          ReentrantReadWriteLock lock = offsetLock.getLock(entry.getKey().getOffset());
+        if (
+          entry.getKey().getHfileName().equals(fileName.getName())
+            && entry.getKey().getBlockType().equals(BlockType.DATA)
+        ) {
+          long offsetToLock = entry.getValue().offset();
+          LOG.debug("found block {} in the backing map. Acquiring read lock for offset {}",
+            entry.getKey(), offsetToLock);
+          ReentrantReadWriteLock lock = offsetLock.getLock(offsetToLock);
           lock.readLock().lock();
           locks.add(lock);
+          // rechecks the given key is still there (no eviction happened before the lock acquired)
           if (backingMap.containsKey(entry.getKey())) {
             count.increment();
+          } else {
+            lock.readLock().unlock();
+            locks.remove(lock);
+            LOG.debug("found block {}, but when locked and tried to count, it was gone.");
           }
         }
       });
-      // We may either place only data blocks on the BucketCache or all type of blocks
-      if (dataBlockCount == count.getValue() || totalBlockCount == count.getValue()) {
+      int metaCount = totalBlockCount - dataBlockCount;
+      // BucketCache would only have data blocks
+      if (dataBlockCount == count.getValue()) {
         LOG.debug("File {} has now been fully cached.", fileName);
         fileCacheCompleted(fileName, size);
       } else {
         LOG.debug(
-          "Prefetch executor completed for {}, but only {} blocks were cached. "
-            + "Total blocks for file: {}. Checking for blocks pending cache in cache writer queue.",
+          "Prefetch executor completed for {}, but only {} data blocks were cached. "
+            + "Total data blocks for file: {}. "
+            + "Checking for blocks pending cache in cache writer queue.",
           fileName, count.getValue(), dataBlockCount);
         if (ramCache.hasBlocksForFile(fileName.getName())) {
+          for (ReentrantReadWriteLock lock : locks) {
+            lock.readLock().unlock();
+          }
           LOG.debug("There are still blocks pending caching for file {}. Will sleep 100ms "
             + "and try the verification again.", fileName);
           Thread.sleep(100);
           notifyFileCachingCompleted(fileName, totalBlockCount, dataBlockCount, size);
-        } else {
-          LOG.info(
-            "We found only {} blocks cached from a total of {} for file {}, "
-              + "but no blocks pending caching. Maybe cache is full?",
-            count, dataBlockCount, fileName);
-        }
+        } else
+          if ((getAllCacheKeysForFile(fileName.getName()).size() - metaCount) == dataBlockCount) {
+            LOG.debug("We counted {} data blocks, expected was {}, there was no more pending in "
+              + "the cache write queue but we now found that total cached blocks for file {} "
+              + "is equal to data block count.", count, dataBlockCount, fileName.getName());
+            fileCacheCompleted(fileName, size);
+          } else {
+            LOG.info("We found only {} data blocks cached from a total of {} for file {}, "
+              + "but no blocks pending caching. Maybe cache is full or evictions "
+              + "happened concurrently to cache prefetch.", count, dataBlockCount, fileName);
+          }
       }
     } catch (InterruptedException e) {
       throw new RuntimeException(e);
