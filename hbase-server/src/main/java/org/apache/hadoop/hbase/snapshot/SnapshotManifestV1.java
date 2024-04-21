@@ -83,7 +83,7 @@ public final class SnapshotManifestV1 {
     }
 
     @Override
-    public void regionClose(final HRegionFileSystem region) {
+    public void regionClose(final HRegionFileSystem region, SnapshotDescription desc) {
     }
 
     @Override
