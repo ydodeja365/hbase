@@ -25,6 +25,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorCompletionService;
+import main.java.org.apache.hadoop.hbase.master.snapshot.SnapshotTableManager;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -84,18 +85,30 @@ public final class SnapshotManifestV2 {
     }
 
     @Override
-    public void regionClose(final SnapshotRegionManifest.Builder region) throws IOException {
+    public void regionClose(final SnapshotRegionManifest.Builder region, SnapshotDescription desc) throws IOException {
       // we should ensure the snapshot dir exist, maybe it has been deleted by master
       // see HBASE-16464
-      FileSystem workingDirFs = snapshotDir.getFileSystem(this.conf);
-      if (workingDirFs.exists(snapshotDir)) {
-        SnapshotRegionManifest manifest = region.build();
-        try (FSDataOutputStream stream =
-          workingDirFs.create(getRegionManifestPath(snapshotDir, manifest))) {
-          manifest.writeTo(stream);
+      String snapshotTable = desc.getTable();
+      boolean flag = false;
+      for(String t: this.conf.get("hbase.snapshot.notFileSystem.tables", "").split(",")){
+        if(t.equals(snapshotTable)){
+          flag = true; break;
         }
+      }
+      if(flag){
+        SnapshotRegionManifest manifest = region.build();
+        new SnapshotTableManager(this.conf).writeRegionManifest(desc, manifest);
       } else {
-        LOG.warn("can't write manifest without parent dir, maybe it has been deleted by master?");
+        FileSystem workingDirFs = snapshotDir.getFileSystem(this.conf);
+        if (workingDirFs.exists(snapshotDir)) {
+          SnapshotRegionManifest manifest = region.build();
+          try (FSDataOutputStream stream = workingDirFs.create(
+            getRegionManifestPath(snapshotDir, manifest))) {
+            manifest.writeTo(stream);
+          }
+        } else {
+          LOG.warn("can't write manifest without parent dir, maybe it has been deleted by master?");
+        }
       }
     }
 
